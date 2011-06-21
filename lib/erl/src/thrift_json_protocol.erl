@@ -42,7 +42,8 @@
 
 -record(json_protocol, {
     transport,
-    context_stack
+    context_stack = [],
+    jsx
 }).
 -type state() :: #json_protocol{}.
 -include("thrift_protocol_behaviour.hrl").
@@ -190,11 +191,11 @@ write(This, struct_end) ->
         {exit_context}
     ]);
 
-write(This, {bool, true})  -> write(This, <<"true">>);
-write(This, {bool, false}) -> write(This, <<"false">>);
+write(This, {bool, true})  -> write_field(This, <<"true">>);
+write(This, {bool, false}) -> write_field(This, <<"false">>);
 
 write(This, {byte, Byte}) ->
-    write(This, list_to_binary(integer_to_list(Byte)));
+    write_field(This, list_to_binary(integer_to_list(Byte)));
 
 write(This, {i16, I16}) ->
     write(This, {byte, I16});
@@ -206,17 +207,49 @@ write(This, {i64, I64}) ->
     write(This, {byte, I64});
 
 write(This, {double, Double}) ->
-    write(This, list_to_binary(io_lib:format("~.*f", [?JSON_DOUBLE_PRECISION,Double])));
+    write_field(This, list_to_binary(io_lib:format("~.*f", [?JSON_DOUBLE_PRECISION,Double])));
 
 
 write(This0, {string, Str}) ->
-    write(This0, [$", list_to_binary(Str), $"]);
+    write_field(This0, case is_binary(Str) of
+        true -> Str;
+        false -> jsx:term_to_json(list_to_binary([$", Str, $"])))
+        end
+    ).
+%% TODO: binary data should be base64 encoded!
 
 %% Data :: iolist()
 write(This = #json_protocol{transport = Trans}, Data) ->
     {NewTransport, Result} = thrift_transport:write(Trans, Data),
     {This#json_protocol{transport = NewTransport}, Result}.
 
+%% prepends ',' ':' or '"' if necessary, etc.
+write_field(This0, Value) ->
+    FieldNo = This0#json_context.fields_processed,
+    CtxtType = This0#json_context.type,
+    Rem = FieldNo rem 2,
+    % write pre-field content
+    {This1, ok} = case {CtxtType, FieldNo, Rem} of
+        {array, N, _} when N > 0 ->
+            write(This0, <<",">>);
+        {object, 0, 0} -> % object key
+            write(This0, <<"\"">>);
+        {object, _, 0} -> % object key
+            write(This0, <<",\"">>);
+        _ ->
+            {This0, ok} % no pre-field necessary
+    end,
+    % write actual field value
+    {This2, ok} = write(This1, Value),
+    % write post-field content
+    {This3, ok} = case {CtxtType, Rem} of
+        {object, 0} -> % object key
+            write(This2, <<"\":">>);
+        _ ->
+            {This2, ok} % no pre-field necessary
+    end,
+    % increment # of processed fields
+    {This3#json_context{fields_processed = FieldNo + 1}, ok}.
 
 write_values(This0, ValueList) ->
     FinalState = lists:foldl(
@@ -228,31 +261,85 @@ write_values(This0, ValueList) ->
         ValueList),
     {FinalState, ok}.
 
+%% I wish the erlang version of the transport interface included a 
+%% read_all function (like eg. the java implementation). Since it doesn't,
+%% here's my version (even though it probably shouldn't be in this file).
+%%
+%% The resulting binary is immediately send to the JSX stream parser.
+%% Subsequent calls to read actually operate on the events returned by JSX.
+read_all(#json_protocol{transport = Transport0} = State) ->
+    {Transport1, Bin} = read_all_1(Transport0, []),
+    P = jsx:decoder(),
+    State#json_protocol{
+        transport = Transport1,
+        jsx = P(Bin)
+    }.
+
+read_all_1(Transport0, IoList) ->
+    Bin = case thrift_transport:read(Transport0, 1) of
+        {Transport1, {ok, Data}} -> % character successfully read; read more
+            read_all_1(Transport1, [Data|IoList]);
+        {Transport1, {error, 'EOF'}} ->
+            iolist_to_binary(lists:reverse(IoList))
+    end,
+    {Transport1, Bin}.
+
+% Throws exception if something other than the expected value is encountered
+expect(#json_protocol{jsx={event, {Type, Data}, Next}}=State, ExpectedType) ->
+    {State#json_protocol{jsx=Next()}, case Type == ExpectedType of
+        true -> 
+            {ok, Data};
+        false ->
+            {error, unexpected_json_event}
+    end};
+expect(#json_protocol{jsx={event, Event, Next}}=State, ExpectedEvent) ->
+     expect(State#json_protocol{jsx={event, {Event, none}, Next}}, ExpectedEvent).
+
+expect_many(State, ExpectedList) ->
+    {State1, ResultList, Status} = expect_many_1(State, ExpectedList, [], ok),
+    % use return value format used elsewhere
+    {State1, {Status, ResultList}}.
+
+expect_many_1(State, [], ResultList, Status) ->
+    {State, lists:reverse(ResultList), Status};
+expect_many_1(State, [Expected|ExpTail], ResultList, Status) ->
+    {State1, {Status, Data}=Result} = expect(State, Expected),
+    NewResultList = [Result|ResultList],
+    case Status of
+        % in case of error, end prematurely
+        error -> expect_many_1(State1, [], NewResultList, Status);
+        ok -> expect_many_1(State1, ExpTail, NewResultList, Status);
+    end.
+
+% wrapper around expect to make life easier for container closing functions
+expect_ending(This, ExpectedEnding) ->
+    {This1, Ret} = expect(This, ExpectedEnding),
+    {This1, case Ret of
+        {ok, _} -> 
+            ok;
+        _Error -> 
+            Ret
+    end}.
+    
 read(This0, message_begin) ->
-    {This1, Initial} = read(This0, ui32),
-    case Initial of
-        {ok, Sz} when Sz =:= ?VERSION_1 ->
-            %% we're at version 1
-            {This2, {ok, Name}}  = read(This1, string),
-            {This3, {ok, SeqId}} = read(This2, i32),
-            Type                 = Sz,
+    % call read_all to get the contents of the transport buffer into JSX.
+    This1 = read_all(This0),
+    % TODO: this should be wrapped in a try/catch
+    {This2, {ok,
+        [_, Version, Type, Name, Seqid]}} = expect_many(This1, 
+            [start_array, integer, integer, string, integer]),
+
+    case Version =:= ?VERSION_1 of
+        true ->
             {This3, #protocol_message_begin{name  = binary_to_list(Name),
                                             type  = Type,
                                             seqid = SeqId}};
-
-        {ok, Sz} when Sz < 0 ->
-            %% there's a version number but it's unexpected
-            {This1, {error, {bad_json_protocol_version, Sz}}};
-
-        {ok, _Sz} ->
-            %% strict_read is true and there's no version header; that's an error
-            {This1, {error, no_json_protocol_version}};
-
-        Else ->
-            {This1, Else}
+        false ->
+            {This2, {error, no_json_protocol_version}}
     end;
 
-read(This, message_end) -> {This, ok};
+read(This, message_end) -> 
+    expect_ending(This, end_object);
 
 read(This, struct_begin) -> {This, ok};
 read(This, struct_end) -> {This, ok};
