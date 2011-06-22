@@ -75,11 +75,18 @@ parse_options([], State) ->
 
 flush_transport(This = #json_protocol{transport = Transport}) ->
     {NewTransport, Result} = thrift_transport:flush(Transport),
-    {This#json_protocol{transport = NewTransport}, Result}.
+    {This#json_protocol{
+            transport = NewTransport,
+            context_stack = []
+        }, Result}.
 
 close_transport(This = #json_protocol{transport = Transport}) ->
     {NewTransport, Result} = thrift_transport:close(Transport),
-    {This#json_protocol{transport = NewTransport}, Result}.
+    {This#json_protocol{
+            transport = NewTransport,
+            context_stack = [],
+            jsx = undefined
+        }, Result}.
 
 %%%
 %%% instance methods
@@ -111,14 +118,13 @@ write(This0, #protocol_message_begin{
 write(This, message_end) ->  
     write_values(This, {exit_context});
 
-% Example field expression: {"1":{"dbl":3.14}}
+% Example field expression: "1":{"dbl":3.14}
 write(This0, #protocol_field_begin{
        name = _Name,
        type = Type,
        id = Id}) ->
     write_values(This0, [
         % entering 'outer' object
-        {enter_context, object},
         {i16, Id},
         % entering 'outer' object
         {enter_context, object},
@@ -131,7 +137,6 @@ write(This, field_stop) ->
 write(This, field_end) -> 
     write_values(This,[
         {exit_context},
-        {exit_context}
     ]);
 % Example message with map: [1,"testMap",1,0,{"1":{"map":["i32","i32",3,{"7":77,"8":88,"9":99}]}}]
 write(This0, #protocol_map_begin{
@@ -284,16 +289,42 @@ read_all_1(Transport0, IoList) ->
     end,
     {Transport1, Bin}.
 
-% Throws exception if something other than the expected value is encountered
+% Expect reads an event from the JSX event stream. It receives an event or data
+% type as input. Comparing the read event from the one is was passed, it
+% returns an error if something other than the expected value is encountered.
+% Expect also maintains the context stack in #json_protocol.
 expect(#json_protocol{jsx={event, {Type, Data}, Next}}=State, ExpectedType) ->
-    {State#json_protocol{jsx=Next()}, case Type == ExpectedType of
+    NextState = State#json_protocol{jsx=Next()},
+    case Type == ExpectedType of
         true -> 
-            {ok, Data};
+            {handle_special_event(NextState, Type), {ok, Data}};
         false ->
-            {error, unexpected_json_event}
-    end};
+            {NextState, {error, unexpected_json_event}}
+    end;
+
 expect(#json_protocol{jsx={event, Event, Next}}=State, ExpectedEvent) ->
      expect(State#json_protocol{jsx={event, {Event, none}, Next}}, ExpectedEvent).
+
+handle_special_event(#json_protocol{context_stack = CtxtStack} = State, Event) ->
+    case Event of
+        start_object ->
+            State#json_protocol{context_stack = [#json_context{
+                    type=object
+                }|CtxtStack]};
+        start_array ->
+            State#json_protocol{context_stack = [#json_context{
+                    type=array
+                }|CtxtStack]};
+        end_object ->
+            State#json_protocol{context_stack = tail(CtxtStack)};
+        end_array ->
+            State#json_protocol{context_stack = tail(CtxtStack)};
+        _ ->
+            State
+    end.
+
+tail([]) -> [];
+tail([Head|Tail]) -> Tail.
 
 expect_many(State, ExpectedList) ->
     {State1, ResultList, Status} = expect_many_1(State, ExpectedList, [], ok),
@@ -311,9 +342,9 @@ expect_many_1(State, [Expected|ExpTail], ResultList, Status) ->
         ok -> expect_many_1(State1, ExpTail, NewResultList, Status);
     end.
 
-% wrapper around expect to make life easier for container closing functions
-expect_ending(This, ExpectedEnding) ->
-    {This1, Ret} = expect(This, ExpectedEnding),
+% wrapper around expect to make life easier for container opening/closing functions
+expect_nodata(This, Expected) ->
+    {This1, Ret} = expect(This, Expected),
     {This1, case Ret of
         {ok, _} -> 
             ok;
@@ -324,25 +355,28 @@ expect_ending(This, ExpectedEnding) ->
 read(This0, message_begin) ->
     % call read_all to get the contents of the transport buffer into JSX.
     This1 = read_all(This0),
-    % TODO: this should be wrapped in a try/catch
-    {This2, {ok,
-        [_, Version, Type, Name, Seqid]}} = expect_many(This1, 
-            [start_array, integer, integer, string, integer]),
-
-    case Version =:= ?VERSION_1 of
-        true ->
-            {This3, #protocol_message_begin{name  = binary_to_list(Name),
-                                            type  = Type,
-                                            seqid = SeqId}};
-        false ->
-            {This2, {error, no_json_protocol_version}}
+    case expect_many(This1, 
+            [start_array, integer, integer, string, integer]) of
+        {This2, {ok, [_, Version, Type, Name, Seqid]}} ->
+            case Version =:= ?VERSION_1 of
+                true ->
+                    {This2, #protocol_message_begin{name  = binary_to_list(Name),
+                                                    type  = Type,
+                                                    seqid = SeqId}};
+                false ->
+                    {This2, {error, no_json_protocol_version}}
+            end;
+        Other -> Other
     end;
 
 read(This, message_end) -> 
-    expect_ending(This, end_object);
+    expect_nodata(This, end_object);
 
 read(This, struct_begin) -> {This, ok};
+    expect_nodata(This, start_object);
+
 read(This, struct_end) -> {This, ok};
+    expect_nodata(This, end_object);
 
 read(This0, field_begin) ->
     {This1, Result} = read(This0, byte),
