@@ -64,10 +64,10 @@ end_context(array) -> "]".
 new(Transport) ->
     new(Transport, _Options = []).
 
-new(Transport, Options) ->
+new(Transport, _Options) ->
     State  = #json_protocol{transport = Transport},
-    State1 = parse_options(Options, State),
-    thrift_protocol:new(?MODULE, State1).
+    %State1 = parse_options(Options, State),
+    thrift_protocol:new(?MODULE, State).
 
 % No options currently
 parse_options([], State) ->
@@ -498,7 +498,8 @@ parse_factory_options([{strict_write, Bool} | Rest], Opts) when is_boolean(Bool)
 
 %% returns a (fun() -> thrift_protocol())
 new_protocol_factory(TransportFactory, Options) ->
-    ParsedOpts = parse_factory_options(Options, #tbp_opts{}),
+    %ParsedOpts = parse_factory_options(Options, #tbp_opts{}),
+    ParsedOpts = #tbp_opts{},
     F = fun() ->
                 {ok, Transport} = TransportFactory(),
                 thrift_json_protocol:new(
