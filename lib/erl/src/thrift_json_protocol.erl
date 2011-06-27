@@ -29,7 +29,6 @@
          write/2,
          flush_transport/1,
          close_transport/1,
-
          new_protocol_factory/2
         ]).
 
@@ -51,8 +50,29 @@
 -define(VERSION_1, 1).
 -define(JSON_DOUBLE_PRECISION, 16).
 
-typeid_to_list(TypeId) ->
-    erlang:atom_to_list(thrift_protocol:typeid_to_atom(TypeId)).
+typeid_to_json(?tType_BOOL) -> "tf";
+typeid_to_json(?tType_BYTE) -> "i8";
+typeid_to_json(?tType_DOUBLE) -> "dbl";
+typeid_to_json(?tType_I16) -> "i16";
+typeid_to_json(?tType_I32) -> "i32";
+typeid_to_json(?tType_I64) -> "i64";
+typeid_to_json(?tType_STRING) -> "str";
+typeid_to_json(?tType_STRUCT) -> "rec";
+typeid_to_json(?tType_MAP) -> "map";
+typeid_to_json(?tType_SET) -> "set";
+typeid_to_json(?tType_LIST) -> "lst".
+
+json_to_typeid("tf") -> ?tType_BOOL;
+json_to_typeid("i8") -> ?tType_BYTE;
+json_to_typeid("dbl") -> ?tType_DOUBLE;
+json_to_typeid("i16") -> ?tType_I16;
+json_to_typeid("i32") -> ?tType_I32;
+json_to_typeid("i64") -> ?tType_I64;
+json_to_typeid("str") -> ?tType_STRING;
+json_to_typeid("rec") -> ?tType_STRUCT;
+json_to_typeid("map") -> ?tType_MAP;
+json_to_typeid("set") -> ?tType_SET;
+json_to_typeid("lst") -> ?tType_LIST.
 
 start_context(object) -> "{";
 start_context(array) -> "[".
@@ -92,16 +112,60 @@ close_transport(This = #json_protocol{transport = Transport}) ->
 %%% instance methods
 %%%
 % places a new context on the stack:
-write(#json_protocol{context_stack = Stack} = State, {enter_context, Type}) ->
-    NewState = State#json_protocol{context_stack = [
+write(#json_protocol{context_stack = Stack} = State0, {enter_context, Type}) ->
+    {State1, ok} = write_values(State0, [{context_pre_item, false}]),
+    State2 = State1#json_protocol{context_stack = [
         #json_context{type=Type}|Stack]},
-    write_values(NewState,  list_to_binary(start_context(Type)));
+    write_values(State2,  [list_to_binary(start_context(Type))]);
 
 % removes the topmost context from stack    
-write(#json_protocol{context_stack = [CurrCtxt|Stack]} = State, {exit_context}) ->
+write(#json_protocol{context_stack = [CurrCtxt|Stack]} = State0, {exit_context}) ->
     Type = CurrCtxt#json_context.type,
-    NewState = State#json_protocol{context_stack = Stack},
-    write_values(NewState, list_to_binary(end_context(Type)));
+    State1 = State0#json_protocol{context_stack = Stack},
+    write_values(State1, [
+            list_to_binary(end_context(Type)),
+            {context_post_item, false}
+        ]);
+
+% writes necessary prelude to field or container depending on current context   
+write(#json_protocol{context_stack = []} = This0,
+    {context_pre_item, _}) -> {This0, ok};
+write(#json_protocol{context_stack = [Context|_CtxtTail]} = This0,
+    {context_pre_item, MayNeedQuotes}) ->
+    FieldNo = Context#json_context.fields_processed,
+    CtxtType = Context#json_context.type,
+    Rem = FieldNo rem 2,
+    case {CtxtType, FieldNo, Rem, MayNeedQuotes} of
+        {array, N, _, _} when N > 0 ->  % array element (not first)
+            write(This0, <<",">>);
+        {object, 0, _, true} -> % non-string object key (first)
+            write(This0, <<"\"">>);
+        {object, N, 0, true} when N > 0 -> % non-string object key (not first)
+            write(This0, <<",\"">>);
+        {object, N, 0, false} when N > 0-> % string object key (not first)
+            write(This0, <<",">>);
+        _ -> % no pre-field necessary
+            {This0, ok}
+    end;
+
+% writes necessary postlude to field or container depending on current context   
+write(#json_protocol{context_stack = []} = This0,
+    {context_post_item, _}) -> {This0, ok};
+write(#json_protocol{context_stack = [Context|CtxtTail]} = This0,
+    {context_post_item, MayNeedQuotes}) ->
+    FieldNo = Context#json_context.fields_processed,
+    CtxtType = Context#json_context.type,
+    Rem = FieldNo rem 2,
+    {This1, ok} = case {CtxtType, Rem, MayNeedQuotes} of
+        {object, 0, true} -> % non-string object key 
+            write(This0, <<"\":">>);
+        {object, 0, false} -> % string object key 
+            write(This0, <<":">>);
+        _ -> % no pre-field necessary
+            {This0, ok}
+    end,
+    NewContext = Context#json_context{fields_processed = FieldNo + 1},
+    {This1#json_protocol{context_stack=[NewContext|CtxtTail]}, ok};
 
 write(This0, #protocol_message_begin{
     name = Name,
@@ -110,13 +174,13 @@ write(This0, #protocol_message_begin{
     write_values(This0, [
         {enter_context, array},
         {i32, ?VERSION_1},
-        {i32, Type},
         {string, Name},
+        {i32, Type},
         {i32, Seqid}
     ]);
 
 write(This, message_end) ->  
-    write_values(This, {exit_context});
+    write_values(This, [{exit_context}]);
 
 % Example field expression: "1":{"dbl":3.14}
 write(This0, #protocol_field_begin{
@@ -128,7 +192,7 @@ write(This0, #protocol_field_begin{
         {i16, Id},
         % entering 'outer' object
         {enter_context, object},
-        {string, typeid_to_list(Type)}
+        {string, typeid_to_json(Type)}
     ]);
 
 write(This, field_stop) -> 
@@ -136,6 +200,7 @@ write(This, field_stop) ->
 
 write(This, field_end) -> 
     write_values(This,[{exit_context}]);
+
 % Example message with map: [1,"testMap",1,0,{"1":{"map":["i32","i32",3,{"7":77,"8":88,"9":99}]}}]
 write(This0, #protocol_map_begin{
        ktype = Ktype,
@@ -143,8 +208,8 @@ write(This0, #protocol_map_begin{
        size = Size}) ->
     write_values(This0, [
         {enter_context, array},
-        {string, typeid_to_list(Ktype)},
-        {string, typeid_to_list(Vtype)},
+        {string, typeid_to_json(Ktype)},
+        {string, typeid_to_json(Vtype)},
         {i32, Size},
         {enter_context, object}
     ]);
@@ -160,7 +225,7 @@ write(This0, #protocol_list_begin{
         size = Size}) ->
     write_values(This0, [
         {enter_context, array},
-        {string, typeid_to_list(Etype)},
+        {string, typeid_to_json(Etype)},
         {i32, Size}
     ]);
 
@@ -175,7 +240,7 @@ write(This0, #protocol_set_begin{
         size = Size}) ->
     write_values(This0, [
         {enter_context, array},
-        {string, typeid_to_list(Etype)},
+        {string, typeid_to_json(Etype)},
         {i32, Size}
     ]);
 
@@ -194,11 +259,23 @@ write(This, struct_end) ->
         {exit_context}
     ]);
 
-write(This, {bool, true})  -> write_field(This, <<"true">>, false);
-write(This, {bool, false}) -> write_field(This, <<"false">>, false);
+write(This, {bool, true})  -> write_values(This, [
+        {context_pre_item, true},
+        <<"true">>,
+        {context_post_item, true}
+    ]);
 
-write(This, {byte, Byte}) ->
-    write_field(This, list_to_binary(integer_to_list(Byte)), false);
+write(This, {bool, false}) -> write_values(This, [
+        {context_pre_item, true},
+        <<"false">>,
+        {context_post_item, true}
+    ]);
+
+write(This, {byte, Byte}) -> write_values(This, [
+        {context_pre_item, true},
+        list_to_binary(integer_to_list(Byte)),
+        {context_post_item, true}
+    ]);
 
 write(This, {i16, I16}) ->
     write(This, {byte, I16});
@@ -209,43 +286,28 @@ write(This, {i32, I32}) ->
 write(This, {i64, I64}) ->
     write(This, {byte, I64});
 
-write(This, {double, Double}) ->
-    write_field(This, list_to_binary(io_lib:format("~.*f",
-        [?JSON_DOUBLE_PRECISION,Double])), false);
+write(This, {double, Double}) -> write_values(This, [
+        {context_pre_item, true},
+        list_to_binary(io_lib:format("~.*f", [?JSON_DOUBLE_PRECISION,Double])),
+        {context_post_item, true}
+    ]);
 
+write(This0, {string, Str}) -> write_values(This0, [
+        {context_pre_item, false},
+        case is_binary(Str) of
+            true -> Str;
+            false -> jsx:term_to_json(list_to_binary(Str))
+        end,
+        {context_post_item, false}
+    ]);
 
-write(This0, {string, Str}) ->
-    write_field(This0, case is_binary(Str) of
-        true -> Str;
-        false -> jsx:term_to_json(list_to_binary([$", Str, $"]))
-        end, true);
-%% TODO: binary data should be base64 encoded
+%% TODO: binary fields should be base64 encoded?
 
 %% Data :: iolist()
 write(This = #json_protocol{transport = Trans}, Data) ->
+    %io:format("Data ~p Ctxt ~p~n~n", [Data, This#json_protocol.context_stack]),
     {NewTransport, Result} = thrift_transport:write(Trans, Data),
     {This#json_protocol{transport = NewTransport}, Result}.
-
-%% prepends ',' ':' or '"' if necessary, etc.
-write_field(This0, Value, HasQuotes) ->
-    FieldNo = This0#json_context.fields_processed,
-    CtxtType = This0#json_context.type,
-    Rem = FieldNo rem 2,
-    {This2, ok} = case {CtxtType, FieldNo, Rem, HasQuotes} of
-        {array, N, _, _} when N > 0 ->  % array element (not first)
-            write(This0, [<<",">>, Value]);
-        {object, 0, _, false} -> % non-string object key (first)
-            write(This0, [<<"\"">>, Value, <<"\":">>]);
-        {object, 0, _, true} -> % string object key (first)
-            write(This0, [Value,<<":">>]);
-        {object, _, 0, false} -> % non-string object key (not first)
-            write(This0, [<<",\"">>, Value, <<"\":">>]);
-        {object, _, 0, true} -> % string object key (not first)
-            write(This0, [<<",">>, Value,<<":">>]);
-        _ -> % no pre-field necessary
-            write(This0, [Value])
-    end,
-   {This2#json_context{fields_processed = FieldNo + 1}, ok}.
 
 write_values(This0, ValueList) ->
     FinalState = lists:foldl(
@@ -272,38 +334,42 @@ read_all(#json_protocol{transport = Transport0} = State) ->
     }.
 
 read_all_1(Transport0, IoList) ->
-    Bin = case thrift_transport:read(Transport0, 1) of
-        {Transport1, {ok, Data}} -> % character successfully read; read more
+    {Transport1, Result} = thrift_transport:read(Transport0, 1),
+    case Result of
+        {ok, <<>>} -> % nothing read: assume we're done
+            {Transport1, iolist_to_binary(lists:reverse(IoList))};
+        {ok, Data} -> % character successfully read; read more
             read_all_1(Transport1, [Data|IoList]);
-        {Transport1, {error, 'EOF'}} ->
-            iolist_to_binary(lists:reverse(IoList))
-    end,
-    {Transport1, Bin}.
+        {error, 'EOF'} -> % we're done
+            {Transport1, iolist_to_binary(lists:reverse(IoList))}
+    end.
 
 % Expect reads an event from the JSX event stream. It receives an event or data
 % type as input. Comparing the read event from the one is was passed, it
 % returns an error if something other than the expected value is encountered.
 % Expect also maintains the context stack in #json_protocol.
-expect(#json_protocol{jsx={event, {Type, Data}, Next}}=State, ExpectedType) ->
+expect(#json_protocol{jsx={event, {Type, Data}=Ev, Next}}=State, ExpectedType) ->
     NextState = State#json_protocol{jsx=Next()},
     case Type == ExpectedType of
         true -> 
-            {NextState, {ok, Data}};
+            {NextState, {ok, convert_data(Type, Data)}};
         false ->
-            {NextState, {error, unexpected_json_event}}
+            {NextState, {error, {unexpected_json_event, Ev}}}
     end;
 
 expect(#json_protocol{jsx={event, Event, Next}}=State, ExpectedEvent) ->
      expect(State#json_protocol{jsx={event, {Event, none}, Next}}, ExpectedEvent).
 
+convert_data(integer, I) -> list_to_integer(I);
+convert_data(float, F) -> list_to_float(F);
+convert_data(_, D) -> D.
+
 expect_many(State, ExpectedList) ->
-    {State1, ResultList, Status} = expect_many_1(State, ExpectedList, [], ok),
-    % use return value format used elsewhere
-    {State1, {Status, ResultList}}.
+    expect_many_1(State, ExpectedList, [], ok).
 
 expect_many_1(State, [], ResultList, Status) ->
-    {State, lists:reverse(ResultList), Status};
-expect_many_1(State, [Expected|ExpTail], ResultList, Status) ->
+    {State, {Status, lists:reverse(ResultList)}};
+expect_many_1(State, [Expected|ExpTail], ResultList, _PrevStatus) ->
     {State1, {Status, Data}} = expect(State, Expected),
     NewResultList = [Data|ResultList],
     case Status of
@@ -329,8 +395,8 @@ read(This0, message_begin) ->
     % call read_all to get the contents of the transport buffer into JSX.
     This1 = read_all(This0),
     case expect_many(This1, 
-            [start_array, integer, integer, string, integer]) of
-        {This2, {ok, [_, Version, Type, Name, SeqId]}} ->
+            [start_array, integer, string, integer, integer]) of
+        {This2, {ok, [_, Version, Name, Type, SeqId]}} ->
             case Version =:= ?VERSION_1 of
                 true ->
                     {This2, #protocol_message_begin{name  = Name,
@@ -343,7 +409,7 @@ read(This0, message_begin) ->
     end;
 
 read(This, message_end) -> 
-    expect_nodata(This, [end_object]);
+    expect_nodata(This, [end_array]);
 
 read(This, struct_begin) -> 
     expect_nodata(This, [start_object]);
@@ -352,17 +418,23 @@ read(This, struct_end) ->
     expect_nodata(This, [end_object]);
 
 read(This0, field_begin) ->
-    case expect_many(This0, 
+    {This1, Read} = expect_many(This0, 
             [%field id
              key, 
              % {} surrounding field
              start_object, 
              % type of field
-             key]) of
-        {This1, {ok, [FieldIdStr, _, FieldType]}} ->
-             {This1, #protocol_field_begin{type = FieldType, id =
-             list_to_integer(FieldIdStr)}}; % TODO: do we need to wrap this in a try/catch?
-        Other -> Other
+             key]),
+    case Read of
+        {ok, [FieldIdStr, _, FieldType]} ->
+            {This1, #protocol_field_begin{
+                type = json_to_typeid(FieldType), 
+                id = list_to_integer(FieldIdStr)}}; % TODO: do we need to wrap this in a try/catch?
+        {error,[{unexpected_json_event, {end_object,none}}]} ->
+            {This1, #protocol_field_begin{type = ?tType_STOP}};
+        Other -> 
+            io:format("**** OTHER branch selected ****"),
+            {This1, Other}
     end;
 
 read(This, field_end) -> 
@@ -445,7 +517,7 @@ read(This0, byte) ->
         {key, K} ->
             {ok, list_to_integer(K)};
         {integer, I} -> 
-            {ok, I}; 
+            {ok, list_to_integer(I)}; 
         _Other ->
             {error, unexpected_event_for_integer}
     end,
@@ -464,7 +536,7 @@ read(This0, double) ->
     {This1, Field} = read_field(This0),
     Value = case Field of
         {float, I} -> 
-            {ok, I}; 
+            {ok, list_to_float(I)}; 
         _Other ->
             {error, unexpected_event_for_double}
     end,
