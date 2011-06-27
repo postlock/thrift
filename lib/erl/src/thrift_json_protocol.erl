@@ -16,6 +16,9 @@
 %% specific language governing permissions and limitations
 %% under the License.
 %%
+%% The JSON protocol implementation was created by
+%% Peter Neumark <neumark.peter@gmail.com> based on
+%% the binary protocol implementation.
 
 -module(thrift_json_protocol).
 

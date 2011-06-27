@@ -16,6 +16,10 @@
 %% specific language governing permissions and limitations
 %% under the License.
 %%
+%% The JSON protocol over HTTP implementation was created by
+%% Peter Neumark <neumark.peter@gmail.com> based on
+%% the binary protocol + socket tutorial. Use with the same server
+%% that the Javascript tutorial uses!
 
 -module(json_client).
 
