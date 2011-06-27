@@ -42,7 +42,7 @@ p(X) ->
     ok.
 
 t() ->
-
+    inets:start(),
     {ok, Client0} = new_client("127.0.0.1:8088", "/thrift/service/tutorial/",
                                            calculator_thrift,
                                            []),
