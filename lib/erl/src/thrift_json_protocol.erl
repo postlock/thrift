@@ -89,12 +89,7 @@ new(Transport) ->
 
 new(Transport, _Options) ->
     State  = #json_protocol{transport = Transport},
-    %State1 = parse_options(Options, State),
     thrift_protocol:new(?MODULE, State).
-
-% No options currently
-parse_options([], State) ->
-    State.
 
 flush_transport(This = #json_protocol{transport = Transport}) ->
     {NewTransport, Result} = thrift_transport:flush(Transport),
@@ -560,27 +555,12 @@ read(This0, string) ->
 
 %%%% FACTORY GENERATION %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
--record(tbp_opts, {strict_read = true,
-                   strict_write = true}).
-
-parse_factory_options([], Opts) ->
-    Opts;
-parse_factory_options([{strict_read, Bool} | Rest], Opts) when is_boolean(Bool) ->
-    parse_factory_options(Rest, Opts#tbp_opts{strict_read=Bool});
-parse_factory_options([{strict_write, Bool} | Rest], Opts) when is_boolean(Bool) ->
-    parse_factory_options(Rest, Opts#tbp_opts{strict_write=Bool}).
-
-
 %% returns a (fun() -> thrift_protocol())
-new_protocol_factory(TransportFactory, Options) ->
-    %ParsedOpts = parse_factory_options(Options, #tbp_opts{}),
-    ParsedOpts = #tbp_opts{},
+new_protocol_factory(TransportFactory, _Options) ->
+    % Only strice read/write are implemented
     F = fun() ->
                 {ok, Transport} = TransportFactory(),
-                thrift_json_protocol:new(
-                  Transport,
-                  [{strict_read,  ParsedOpts#tbp_opts.strict_read},
-                   {strict_write, ParsedOpts#tbp_opts.strict_write}])
+                thrift_json_protocol:new(Transport, [])
         end,
     {ok, F}.
 
